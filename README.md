@@ -1,0 +1,1 @@
+A Movies Recommendation System, using Matrix Decomposition to recommend movies. This was train on MovieLen-1M dataset.
