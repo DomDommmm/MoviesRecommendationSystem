@@ -3,6 +3,9 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.model_selection import TimeSeriesSplit
 import optuna
+import datetime
+import pickle
+import time
 
 from utils import ALSConfig, ALSExplicitQR
 
@@ -29,7 +32,7 @@ def split_train_test_by_time(df: pd.DataFrame, test_size: float = 0.2) -> tuple[
     return train_df, test_df
 
 
-def prepare_fold(train_df: pd.DataFrame, val_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, int, int, float]:
+def prepare_fold(train_df: pd.DataFrame, val_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, int, int, float, dict, dict]:
     """
     1. Creates UserID and MovieID dictionaries based STRICTLY on train_df
     2. Filters out cold-starts from val_df
@@ -65,7 +68,7 @@ def prepare_fold(train_df: pd.DataFrame, val_df: pd.DataFrame) -> tuple[pd.DataF
         val_mapped['user_idx'] = pd.Series([], dtype=int)
         val_mapped['movie_idx'] = pd.Series([], dtype=int)
     
-    return train_mapped, val_mapped, num_users, num_movies, global_mean
+    return train_mapped, val_mapped, num_users, num_movies, global_mean, user_map, movie_map
 
 
 def build_csr_matrix(df: pd.DataFrame, num_users: int, num_movies: int, rating_col: str = 'Rating_centered') -> csr_matrix:
@@ -104,7 +107,7 @@ def cross_validate_als(df: pd.DataFrame, n_splits: int = 5) -> None:
         train_raw = df.iloc[train_idx]
         val_raw = df.iloc[val_idx]
 
-        train_mapped, val_mapped, num_users, num_movies, global_mean = prepare_fold(train_raw, val_raw)
+        train_mapped, val_mapped, num_users, num_movies, global_mean, _, _ = prepare_fold(train_raw, val_raw)
 
         R_train = build_csr_matrix(train_mapped, num_users, num_movies, rating_col='Rating_centered')
         model = ALSExplicitQR(config)
@@ -135,10 +138,14 @@ def evaluate_config(
     fold_scores: list[float] = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(tss.split(df), start=1):
+        fold_start = time.time()
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        print(f"[{current_time}]  --> Training Fold {fold_idx}/{n_splits} on GPU...")
+        
         train_raw = df.iloc[train_idx]
         val_raw = df.iloc[val_idx]
 
-        train_mapped, val_mapped, num_users, num_movies, global_mean = prepare_fold(train_raw, val_raw)
+        train_mapped, val_mapped, num_users, num_movies, global_mean, _, _ = prepare_fold(train_raw, val_raw)
 
         if len(val_mapped) == 0:
             continue
@@ -150,23 +157,28 @@ def evaluate_config(
         train_rmse_centered = model.rmse_observed(R_train)
         val_rmse = rmse_on_dataframe(val_mapped, user_factors, item_factors, global_mean)
         fold_scores.append(val_rmse)
+        
+        fold_elapsed = time.time() - fold_start
+        print(f"      Fold {fold_idx} completed in {fold_elapsed:.2f}s (RMSE: {val_rmse:.6f})")
 
     mean_score = float(np.mean(fold_scores))
     return mean_score
 
 
-def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 10, n_splits: int = 5) -> ALSConfig:
+def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 10, n_splits: int = 4) -> ALSConfig:
     def objective(trial: optuna.Trial) -> float:
         config = ALSConfig(
-            factors=trial.suggest_int("factors", 8, 32, step=8),
+            factors=trial.suggest_categorical("factors", [16, 32, 64, 128]),
             reg_user=trial.suggest_float("reg_user", 1e-4, 0.5, log=True),
             reg_item=trial.suggest_float("reg_item", 1e-4, 0.5, log=True),
-            iterations=trial.suggest_int("iterations", 5, 20),
+            iterations=trial.suggest_int("iterations", 10, 30, step = 5),
             seed=7,
             verbose=False,
         )
+        trial_start = time.time()
         score = evaluate_config(df, config, n_splits=n_splits)
-        print(f"Trial {trial.number:02d}: score={score:.6f} params={config}")
+        trial_elapsed = time.time() - trial_start
+        print(f"Trial {trial.number:02d} completed in {trial_elapsed:.2f}s: score={score:.6f} params={config}")
         return score
 
     study = optuna.create_study(direction="minimize")
@@ -189,6 +201,7 @@ def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 10, n_splits: int
 
 
 def main() -> None:
+    total_start = time.time()
     # Changed standard file load to point to our newly generated 32M filtered DB!
     df = preprocess('./ratings_filtered.csv')
     
@@ -196,11 +209,11 @@ def main() -> None:
 
     print(f"Train rows (Raw): {len(train_df)} | Test rows (Raw): {len(test_df)}")
 
-    best_config = optimize_hyperparameters(train_df, n_trials=50, n_splits=5)
+    best_config = optimize_hyperparameters(train_df, n_trials=30)
 
     print(f"Chạy lại ALS với best config trên bộ Train gốc: {best_config}")
     
-    train_mapped, test_mapped, num_users, num_movies, global_mean = prepare_fold(train_df, test_df)
+    train_mapped, test_mapped, num_users, num_movies, global_mean, user_map, movie_map = prepare_fold(train_df, test_df)
     print(f"Warm-Start Test rows thực tế để đánh giá: {len(test_mapped)} / {len(test_df)}")
 
     R_train_full = build_csr_matrix(train_mapped, num_users, num_movies, rating_col='Rating_centered')
@@ -214,6 +227,20 @@ def main() -> None:
     print(f"Test RMSE: {test_rmse:.6f}")
     print(f"User factors shape: {user_factors.shape}")
     print(f"Item factors shape: {item_factors.shape}")
+
+    print("\nExporting final model to 'als_model2.pkl'...")
+    model_data = {
+        "user_factors": user_factors,
+        "item_factors": item_factors,
+        "user_map": user_map,
+        "movie_map": movie_map,
+        "global_mean": global_mean
+    }
+    with open('als_model2.pkl', 'wb') as f:
+        pickle.dump(model_data, f)
+        
+    total_elapsed = time.time() - total_start
+    print(f"Model saved! Total script execution time: {total_elapsed / 60:.2f} minutes.")
 
 
 if __name__ == '__main__':

@@ -127,25 +127,56 @@ class ALSExplicitQR:
         y: torch.Tensor,
         reg_user: float,
         reg_item: float,
+        batch_size: int = 2_000_000
     ) -> float:
-        # Pushing COE to compute unified device loss avoiding cpu bottlenecks
+        """
+        OOM-Safe Batched Loss Computation.
+        Processes the massive CSR matrix in manageable chunks to prevent VRAM spikes.
+        """
         coo = ratings_csr.tocoo(copy=False)
         rows_t = torch.from_numpy(coo.row).to(self.device, non_blocking=True)
         cols_t = torch.from_numpy(coo.col).to(self.device, non_blocking=True)
         data_t = torch.from_numpy(coo.data).to(self.device, non_blocking=True)
 
-        preds = (x[rows_t] * y[cols_t]).sum(dim=1)
-        residual = data_t - preds
-        data_loss = float((residual * residual).sum().item())
+        n_elements = data_t.shape[0]
+        data_loss = 0.0
+
+        # Iterating through the elements in safe batches
+        for start_idx in range(0, n_elements, batch_size):
+            end_idx = min(start_idx + batch_size, n_elements)
+            
+            r_batch = rows_t[start_idx:end_idx]
+            c_batch = cols_t[start_idx:end_idx]
+            d_batch = data_t[start_idx:end_idx]
+
+            preds = (x[r_batch] * y[c_batch]).sum(dim=1)
+            residual = d_batch - preds
+            data_loss += float((residual * residual).sum().item())
+
         reg_loss = float(reg_user * (x * x).sum().item() + reg_item * (y * y).sum().item())
         return data_loss + reg_loss
 
     def rmse_observed(self, ratings_csr: sparse.csr_matrix) -> float:
         if self.user_factors is None or self.item_factors is None:
             raise ValueError("Model must be fitted before calling rmse_observed().")
+        
+        # Applying the same batching logic to RMSE to keep it completely OOM-safe
         coo = ratings_csr.tocoo(copy=False)
-        preds = np.einsum("ij,ij->i", self.user_factors[coo.row], self.item_factors[coo.col])
-        mse = np.mean((coo.data - preds) ** 2)
+        n_elements = coo.data.shape[0]
+        batch_size = 2_000_000
+        total_sq_error = 0.0
+
+        for start_idx in range(0, n_elements, batch_size):
+            end_idx = min(start_idx + batch_size, n_elements)
+            
+            r_batch = coo.row[start_idx:end_idx]
+            c_batch = coo.col[start_idx:end_idx]
+            d_batch = coo.data[start_idx:end_idx]
+            
+            preds = np.einsum("ij,ij->i", self.user_factors[r_batch], self.item_factors[c_batch])
+            total_sq_error += np.sum((d_batch - preds) ** 2)
+
+        mse = total_sq_error / n_elements
         return float(np.sqrt(mse))
 
 def _find_first_existing(paths: Iterable[Path]) -> Path | None:
