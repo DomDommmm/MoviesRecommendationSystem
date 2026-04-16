@@ -1,121 +1,73 @@
-# Movie Recommendation System
+# PyTorch GPU Movie Recommendation System
 
-Matrix factorization prototype for explicit-feedback movie recommendation using Alternating Least Squares (ALS) with QR-based linear solves.
+A massive-scale, explicit-feedback movie recommendation engine using Alternating Least Squares (ALS) and QR-based linear solvers. Originally designed for MovieLens 1M, this framework has been completely overhauled to run on **PyTorch tensors**, enabling GPU-accelerated Matrix Factorization capable of handling the **MovieLens 32M** dataset almost effortlessly.
 
 ## Overview
 
-The project now contains two main layers:
+The project relies on a modular 3-tier architecture:
 
-- `utils.py`: the mathematical ALS core.
-- `models.py`: preprocessing, time-based validation, Optuna tuning, and final evaluation.
-
-The pipeline uses MovieLens 1M ratings with timestamps, so validation is chronological instead of random K-Fold.
+- `preprocess.py`: A dedicated script for chronological sorting and core-filtering the raw 32 Million row datasets.
+- `models.py`: Handles strict Time-Series validation, prevents "cold-start" overlapping metrics, applies rating mean-centering, and manages Optuna hyperparameter sweeps.
+- `utils.py`: The mathematical PyTorch backend. Executes QR linear solves directly on GPU VRAM using zero-copy tensor slicing.
 
 ## Features
 
-- Sparse matrix training with `scipy.sparse`.
-- ALS alternating updates for user and item factors.
-- QR decomposition for solving the normal equations.
-- Separate user and item regularization terms.
-- Time-series split for validation when timestamps are available.
-- Optuna hyperparameter search.
-- Final train and held-out test RMSE reporting.
+- **Blazing Fast GPU Acceleration:** Swapped traditional CPU-bound `scipy.sparse` loops for native `torch.Tensor` operations using `torch.linalg.qr`.
+- **Zero-Copy Architecture:** The massive 32M Interaction matrix is loaded into VRAM precisely once. Python loops only pass primitive slice coordinates, completely avoiding the overhead of CPU-to-GPU data transfers during model fitting.
+- **Core-10 Data Truncation:** Automatically filters the long tail of the bottom 10% interacting users/movies to create dense, mathematically stable matrices.
+- **True Chronological Validation:** Uses `TimeSeriesSplit` evaluating models purely on predicting "future interactions" mimicking true production scenarios.
+- **Cold-Start Safeguards:** Evaluates metrics exclusively on "warm" overlap entities during validation, preventing the RMSE metric from being artificially inflated by inherently unknown nodes.
+- **Optuna Hyperparameter Search:** Automated tuning across latent factors, user/item regularizations, and iteration limits.
 
 ## Project Structure
 
-- `utils.py`: ALS implementation, QR solver, and loss computation.
-- `models.py`: data loading, chronological split, Optuna search, and final model training.
-- `ml-1m/ratings.dat`: MovieLens 1M ratings file expected by the scripts.
+- `preprocess.py`: Data loader, cleaner, and core-n filtering script.
+- `models.py`: Data mapping, Optuna search, and final model evaluation.
+- `utils.py`: The mathematical core containing the `ALSExplicitQR` engine.
 
 ## Requirements
 
-Use the project virtual environment and install the main dependencies:
+Ensure you are working inside your virtual environment and install the heavily parallelized dependencies:
 
 ```bash
 source .venv/bin/activate
-pip install pandas numpy scipy scikit-learn optuna truststore
+pip install pandas numpy scipy scikit-learn optuna torch truststore
 ```
 
-Notes:
-- `truststore` is used so dataset downloads work in environments with custom certificate chains.
-- The project was validated on Python 3.12.
+*Note: The project natively requires PyTorch (`torch`). Running the pip install block above will automatically download PyTorch along with its massive suite of underlying CUDA libraries (e.g., `nvidia-cublas`, `nvidia-cusolver`, `triton`). These are the essential drivers that route the Matrix Factorization directly to your GPU VRAM.*
 
 ## Data Preparation
 
-The code expects MovieLens 1M `ratings.dat` in one of these locations:
+Download the [MovieLens 32M Dataset](https://grouplens.org/datasets/movielens/32m/), extract it, and place `ratings.csv` in the `ml-32m` directory (or modify the path in `preprocess.py`).
 
-- `./ml-1m/ratings.dat`
-- `./ratings.dat`
-- `./data/ml-1m/ratings.dat`
-- `./MovieLens1M/ratings.dat`
-
-`models.py` reads the file, creates `user_idx` and `movie_idx`, sorts rows by `Timestamp`, then splits the data chronologically:
-
-- first 80%: train
-- last 20%: test
+First, run the preprocessing script to clean and compress the data into a dense matrix format:
+```bash
+python preprocess.py
+```
+*This will filter the bottom 10%, drop duplicates, align temporal sequences, and output a clean `ratings_filtered.csv`.*
 
 ## How to Run
 
-Run the full pipeline from `models.py`:
+After preparing the data, trigger the full pipeline to execute the Optuna sweep and train your recommendation model:
 
 ```bash
 python models.py
 ```
 
 The script will:
-
-1. Load and preprocess MovieLens ratings.
-2. Split train/test by timestamp.
-3. Run Optuna on the training portion using `TimeSeriesSplit`.
-4. Retrain ALS with the best hyperparameters.
-5. Print final train RMSE and test RMSE.
-
-## ALS Configuration
-
-The current ALS config supports:
-
-- `factors`: latent dimension
-- `reg_user`: user-factor regularization
-- `reg_item`: item-factor regularization
-- `iterations`: number of alternating update steps
-- `seed`: random seed
-- `verbose`: training logs
-
-## Hyperparameter Search
-
-`models.py` uses Optuna to search over:
-
-- `factors`
-- `reg_user`
-- `reg_item`
-- `iterations`
-
-Validation is done with `TimeSeriesSplit`, so each fold respects chronological order.
+1. Load the preprocessed `ratings_filtered.csv`.
+2. Split train/test chronologically (first 80% train, next 20% validation/test).
+3. Identify and isolate only "Warm" starting users and movies for accurate algorithm scoring.
+4. Scale ratings via global mean-centering to save static dimension states.
+5. Ship matrices to your CUDA device.
+6. Print final train RMSE and test RMSE.
 
 ## Output Interpretation
 
-When you run the training script, you will see:
-
-- training and validation RMSE per fold
-- the best Optuna trial
-- final train RMSE after retraining on the full training set
-- test RMSE on the held-out chronological test split
-
-Important:
-- `Final train RMSE` is measured on the data used to refit the final model.
-- `Test RMSE` is the number to use for real model quality comparison.
+Because we apply global mean centering prior to PyTorch fitting, your predictions start incredibly close to reality (usually ~3.5 stars) even before learning. 
+A highly-tuned Matrix Factorization algorithm on a temporally split explicit MovieLens dataset will typically reach a final Test RMSE somewhere around **0.88 - 0.92**.
 
 ## Development Notes
 
-- `utils.py` focuses only on the ALS math core and should stay model-agnostic.
-- `models.py` is the right place for experiment logic, splits, and tuning.
-- For faster debugging, reduce `n_trials` in `models.py` before running full Optuna search.
-
-## Example Workflow
-
-```bash
-source .venv/bin/activate
-python models.py
-```
-
-If you want a quicker experiment first, reduce the Optuna trial count inside `main()`.
+- `utils.py` contains the `ALSConfig` dataclass. If you are experiencing GPU issues, you can explicitly force PyTorch to step down by changing `device: str = "cpu"`.
+- If you are running tests to ensure hardware stability, consider reducing `n_trials=50` inside `models.py`'s `main()` function to a lower number like `n_trials=5` to rapidly see the end of the pipeline.

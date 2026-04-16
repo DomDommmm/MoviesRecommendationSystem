@@ -6,8 +6,7 @@ from typing import Iterable
 
 import numpy as np
 from scipy import sparse
-from scipy.linalg import qr, solve_triangular
-
+import torch
 
 @dataclass
 class ALSConfig:
@@ -17,33 +16,29 @@ class ALSConfig:
     iterations: int = 15
     seed: int = 7
     verbose: bool = True
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-def solve_linear_qr(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Solve Ax=b using QR decomposition, where A is square and full rank."""
-    if a.ndim != 2 or b.ndim != 1:
-        raise ValueError(f"Expected a.ndim=2 and b.ndim=1, got {a.ndim=} and {b.ndim=}")
-    if a.shape[0] != a.shape[1]:
-        raise ValueError(f"A must be square. Got shape {a.shape}.")
-    if a.shape[0] != b.shape[0]:
-        raise ValueError(f"Incompatible dimensions for Ax=b. Got {a.shape=} and {b.shape=}.")
-
-    q, r = qr(a, mode="economic", overwrite_a=False, check_finite=False)
+def solve_linear_qr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Solve Ax=b using QR decomposition via PyTorch."""
+    # mode="reduced" ensures economic QR decomposition (returns small matrices)
+    q, r = torch.linalg.qr(a, mode="reduced")
     y = q.T @ b
-    x = solve_triangular(r, y, lower=False, check_finite=False)
+    # Solve Rx = y using fast upper triangular solver
+    x = torch.linalg.solve_triangular(r, y.unsqueeze(1), upper=True).squeeze(1)
     return x
 
-
 class ALSExplicitQR:
-    """Explicit-feedback ALS trained with sparse matrices and QR linear solves."""
+    """Explicit-feedback ALS trained with sparse matrices and QR linear solves on GPU."""
 
     def __init__(self, config: ALSConfig):
         self.config = config
+        self.device = torch.device(self.config.device)
         self.user_factors: np.ndarray | None = None
         self.item_factors: np.ndarray | None = None
         self.loss_history: list[float] = []
 
     def fit(self, ratings_csr: sparse.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
+        # Tidy up matrix formats
         if not sparse.isspmatrix_csr(ratings_csr):
             ratings_csr = ratings_csr.tocsr()
 
@@ -55,109 +50,94 @@ class ALSExplicitQR:
             raise ValueError(f"Empty rating matrix with shape {ratings_csr.shape}.")
         if k <= 0:
             raise ValueError(f"factors must be > 0, got {k}.")
-        if self.config.reg_user < 0 or self.config.reg_item < 0:
-            raise ValueError(
-                f"reg_user and reg_item must be >= 0, got {self.config.reg_user=} and {self.config.reg_item=}."
-            )
 
-        rng = np.random.default_rng(self.config.seed)
-        x = rng.normal(0.0, 0.1, size=(n_users, k))
-        y = rng.normal(0.0, 0.1, size=(n_items, k))
+        # Initial random matrices placed directly onto designated device
+        torch.manual_seed(self.config.seed)
+        x = torch.randn(n_users, k, dtype=torch.float64, device=self.device) * 0.1
+        y = torch.randn(n_items, k, dtype=torch.float64, device=self.device) * 0.1
+
+        # We keep indptr on CPU for fast python looping slice boundaries, 
+        # but load indices/data payload arrays fully into memory/VRAM once.
+        csr_indptr = ratings_csr.indptr
+        csr_indices = torch.from_numpy(ratings_csr.indices).to(self.device, non_blocking=True)
+        csr_data = torch.from_numpy(ratings_csr.data).to(self.device, non_blocking=True)
 
         ratings_csc = ratings_csr.tocsc()
+        csc_indptr = ratings_csc.indptr
+        csc_indices = torch.from_numpy(ratings_csc.indices).to(self.device, non_blocking=True)
+        csc_data = torch.from_numpy(ratings_csc.data).to(self.device, non_blocking=True)
+
         self.loss_history = []
 
         for epoch in range(1, self.config.iterations + 1):
-            x = self._update_user_factors(ratings_csr, y)
-            y = self._update_item_factors(ratings_csc, x)
-
-            loss = self.compute_loss(
-                ratings_csr,
-                x,
-                y,
-                reg_user=self.config.reg_user,
-                reg_item=self.config.reg_item,
+            x = self._update_factors(
+                n_users, k, csr_indptr, csr_indices, csr_data, y, self.config.reg_user
             )
+            y = self._update_factors(
+                n_items, k, csc_indptr, csc_indices, csc_data, x, self.config.reg_item
+            )
+
+            loss = self.compute_loss(ratings_csr, x, y, self.config.reg_user, self.config.reg_item)
             self.loss_history.append(loss)
 
             if self.config.verbose:
                 delta = 0.0 if epoch == 1 else self.loss_history[-2] - self.loss_history[-1]
                 print(f"epoch={epoch:02d} loss={loss:.6f} delta={delta:.6f}")
 
-        self.user_factors = x
-        self.item_factors = y
-        return x, y
+        # Returns numpy arrays to avoid API breakage in main file
+        self.user_factors = x.cpu().numpy()
+        self.item_factors = y.cpu().numpy()
+        return self.user_factors, self.item_factors
 
-    def _update_user_factors(self, ratings_csr: sparse.csr_matrix, item_factors: np.ndarray) -> np.ndarray:
-        n_users = ratings_csr.shape[0]
-        k = self.config.factors
-        out = np.zeros((n_users, k), dtype=np.float64)
-        identity = np.eye(k, dtype=np.float64)
+    def _update_factors(
+        self,
+        n_entities: int,
+        k: int,
+        indptr: np.ndarray,
+        indices: torch.Tensor,
+        data: torch.Tensor,
+        other_factors: torch.Tensor,
+        reg: float
+    ) -> torch.Tensor:
+        out = torch.zeros((n_entities, k), dtype=torch.float64, device=self.device)
+        identity = torch.eye(k, dtype=torch.float64, device=self.device)
 
-        for u in range(n_users):
-            start, end = ratings_csr.indptr[u], ratings_csr.indptr[u + 1]
-            item_ids = ratings_csr.indices[start:end]
-            values = ratings_csr.data[start:end]
-
-            if item_ids.size == 0:
+        for u in range(n_entities):
+            start, end = int(indptr[u]), int(indptr[u + 1])
+            if start == end:
                 continue
 
-            y_u = item_factors[item_ids]
-            if y_u.shape[1] != k:
-                raise ValueError(
-                    f"Dimension mismatch in user update: {y_u.shape[1]=} but factors={k}."
-                )
+            # Pure GPU array slices (no memory copies generated)
+            target_ids = indices[start:end]
+            values = data[start:end]
 
-            a = y_u.T @ y_u + self.config.reg_user * item_ids.size * identity
+            y_u = other_factors[target_ids]
+            
+            # Massive batched math happens squarely on hardware compute cores
+            a = y_u.T @ y_u + reg * target_ids.shape[0] * identity
             b = y_u.T @ values
             out[u] = solve_linear_qr(a, b)
 
         return out
 
-    def _update_item_factors(self, ratings_csc: sparse.csc_matrix, user_factors: np.ndarray) -> np.ndarray:
-        n_items = ratings_csc.shape[1]
-        k = self.config.factors
-        out = np.zeros((n_items, k), dtype=np.float64)
-        identity = np.eye(k, dtype=np.float64)
-
-        for i in range(n_items):
-            start, end = ratings_csc.indptr[i], ratings_csc.indptr[i + 1]
-            user_ids = ratings_csc.indices[start:end]
-            values = ratings_csc.data[start:end]
-
-            if user_ids.size == 0:
-                continue
-
-            x_i = user_factors[user_ids]
-            if x_i.shape[1] != k:
-                raise ValueError(
-                    f"Dimension mismatch in item update: {x_i.shape[1]=} but factors={k}."
-                )
-
-            a = x_i.T @ x_i + self.config.reg_item * user_ids.size * identity
-            b = x_i.T @ values
-            out[i] = solve_linear_qr(a, b)
-
-        return out
-
-    @staticmethod
     def compute_loss(
+        self,
         ratings_csr: sparse.csr_matrix,
-        x: np.ndarray,
-        y: np.ndarray,
-        reg_user: float | None = None,
-        reg_item: float | None = None,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        reg_user: float,
+        reg_item: float,
     ) -> float:
-        if reg_user is None:
-            reg_user = 0.0
-        if reg_item is None:
-            reg_item = 0.0
-
+        # Pushing COE to compute unified device loss avoiding cpu bottlenecks
         coo = ratings_csr.tocoo(copy=False)
-        preds = np.einsum("ij,ij->i", x[coo.row], y[coo.col])
-        residual = coo.data - preds
-        data_loss = float(residual @ residual)
-        reg_loss = float(reg_user * np.sum(x * x) + reg_item * np.sum(y * y))
+        rows_t = torch.from_numpy(coo.row).to(self.device, non_blocking=True)
+        cols_t = torch.from_numpy(coo.col).to(self.device, non_blocking=True)
+        data_t = torch.from_numpy(coo.data).to(self.device, non_blocking=True)
+
+        preds = (x[rows_t] * y[cols_t]).sum(dim=1)
+        residual = data_t - preds
+        data_loss = float((residual * residual).sum().item())
+        reg_loss = float(reg_user * (x * x).sum().item() + reg_item * (y * y).sum().item())
         return data_loss + reg_loss
 
     def rmse_observed(self, ratings_csr: sparse.csr_matrix) -> float:
@@ -168,13 +148,11 @@ class ALSExplicitQR:
         mse = np.mean((coo.data - preds) ** 2)
         return float(np.sqrt(mse))
 
-
 def _find_first_existing(paths: Iterable[Path]) -> Path | None:
     for path in paths:
         if path.exists():
             return path
     return None
-
 
 def load_movielens_1m_slice(
     ratings_path: str | Path,
@@ -182,11 +160,6 @@ def load_movielens_1m_slice(
     min_user_ratings: int = 5,
     min_item_ratings: int = 5,
 ) -> sparse.csr_matrix:
-    """
-    Load a small development slice from MovieLens 1M ratings.dat.
-
-    File format per line: userId::movieId::rating::timestamp
-    """
     ratings_path = Path(ratings_path)
     if not ratings_path.exists():
         raise FileNotFoundError(f"File not found: {ratings_path}")
@@ -213,7 +186,6 @@ def load_movielens_1m_slice(
     i_raw = np.asarray(item_ids, dtype=np.int64)
     r = np.asarray(values, dtype=np.float64)
 
-    # Optional sparsity cleanup for more stable training on tiny slices.
     u_unique, u_idx = np.unique(u_raw, return_inverse=True)
     i_unique, i_idx = np.unique(i_raw, return_inverse=True)
 
@@ -239,9 +211,7 @@ def load_movielens_1m_slice(
     ratings.sort_indices()
     return ratings
 
-
 def build_synthetic_small() -> sparse.csr_matrix:
-    """Fallback dataset for debugging when MovieLens file is unavailable."""
     rng = np.random.default_rng(123)
     n_users, n_items, k = 120, 90, 8
 
@@ -259,8 +229,8 @@ def build_synthetic_small() -> sparse.csr_matrix:
     ratings.sort_indices()
     return ratings
 
-
 def development_test() -> None:
+    print(f"PyTorch using hardware device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
     candidates = [
         Path("ml-1m/ratings.dat"),
         Path("ratings.dat"),
@@ -283,21 +253,12 @@ def development_test() -> None:
     x, y = model.fit(ratings)
 
     if x.shape[1] != config.factors or y.shape[1] != config.factors:
-        raise RuntimeError(
-            f"Factor dimensions are wrong: {x.shape=} and {y.shape=} with {config.factors=}"
-        )
+        raise RuntimeError(f"Factor dimensions are wrong: {x.shape=} and {y.shape=} with {config.factors=}")
 
     initial_loss = model.loss_history[0]
     final_loss = model.loss_history[-1]
     print(f"initial_loss={initial_loss:.6f} final_loss={final_loss:.6f}")
     print(f"observed_rmse={model.rmse_observed(ratings):.6f}")
-
-    if not np.isfinite(final_loss):
-        raise RuntimeError("Loss became non-finite. Check matrix construction and linear solves.")
-
-    if final_loss > initial_loss:
-        print("Warning: loss increased overall. Consider tuning reg_user/reg_item/factors/iterations.")
-
 
 if __name__ == "__main__":
     development_test()

@@ -6,26 +6,14 @@ import optuna
 
 from utils import ALSConfig, ALSExplicitQR
 
-def preprocess(file_path='ratings.dat'):
-    # MovieLens-1M dùng dâu '::' để phân cách cột
-    col_names = ['UserID', 'MovieID', 'Rating', 'Timestamp']
-    df = pd.read_csv(file_path, sep='::', engine='python', names=col_names)
+def preprocess(file_path='ratings_filtered.csv'):
+    print(f"Đang tải dataset đã lọc: {file_path}...")
+    # Load standardized CSV
+    df = pd.read_csv(file_path)
+    print(f"Tổng số đánh giá sử dụng: {len(df):,}")
     
-    print(f"Tổng số đánh giá ban đầu: {len(df)}")
-
-    df['user_idx'] = df['UserID'].astype('category').cat.codes
-    df['movie_idx'] = df['MovieID'].astype('category').cat.codes
-
-    # Sort by time so any later split respects the original rating order.
-    df = df.sort_values('Timestamp', kind='mergesort').reset_index(drop=True)
-    
-    num_users = df['user_idx'].nunique()
-    num_movies = df['movie_idx'].nunique()
-    print(f"Số Users thực tế: {num_users} | Số Movies thực tế: {num_movies}")
-
-    print("Hoàn tất!")
-
-    return df, num_users, num_movies
+    # We do not need to sort by Timestamp here again because preprocess.py already strictly ordered it!
+    return df
 
 
 def split_train_test_by_time(df: pd.DataFrame, test_size: float = 0.2) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -41,10 +29,49 @@ def split_train_test_by_time(df: pd.DataFrame, test_size: float = 0.2) -> tuple[
     return train_df, test_df
 
 
-def build_csr_matrix(df: pd.DataFrame, num_users: int, num_movies: int) -> csr_matrix:
+def prepare_fold(train_df: pd.DataFrame, val_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, int, int, float]:
+    """
+    1. Creates UserID and MovieID dictionaries based STRICTLY on train_df
+    2. Filters out cold-starts from val_df
+    3. Calculates global_mean and mean-centers the train ratings
+    """
+    user_uniques = train_df['UserID'].unique()
+    movie_uniques = train_df['MovieID'].unique()
+    
+    user_map = {uid: idx for idx, uid in enumerate(user_uniques)}
+    movie_map = {mid: idx for idx, mid in enumerate(movie_uniques)}
+    
+    train_mapped = train_df.copy()
+    train_mapped['user_idx'] = train_mapped['UserID'].map(user_map).astype(int)
+    train_mapped['movie_idx'] = train_mapped['MovieID'].map(movie_map).astype(int)
+    
+    global_mean = float(train_mapped['Rating'].mean())
+    train_mapped['Rating_centered'] = train_mapped['Rating'] - global_mean
+    
+    num_users = len(user_map)
+    num_movies = len(movie_map)
+    
+    # Filter validation set against cold-starts (users/movies not in train_df)
+    val_mapped = val_df[
+        val_df['UserID'].isin(user_map) & 
+        val_df['MovieID'].isin(movie_map)
+    ].copy()
+    
+    if len(val_mapped) > 0:
+        val_mapped['user_idx'] = val_mapped['UserID'].map(user_map).astype(int)
+        val_mapped['movie_idx'] = val_mapped['MovieID'].map(movie_map).astype(int)
+    else:
+        # Fallback if empty
+        val_mapped['user_idx'] = pd.Series([], dtype=int)
+        val_mapped['movie_idx'] = pd.Series([], dtype=int)
+    
+    return train_mapped, val_mapped, num_users, num_movies, global_mean
+
+
+def build_csr_matrix(df: pd.DataFrame, num_users: int, num_movies: int, rating_col: str = 'Rating_centered') -> csr_matrix:
     # CSR (Compressed Sparse Row) tối ưu cho các phép toán đại số tuyến tính trong ALS.
     matrix = csr_matrix(
-        (df['Rating'], (df['user_idx'], df['movie_idx'])),
+        (df[rating_col], (df['user_idx'], df['movie_idx'])),
         shape=(num_users, num_movies)
     )
     matrix.sum_duplicates()
@@ -52,16 +79,21 @@ def build_csr_matrix(df: pd.DataFrame, num_users: int, num_movies: int) -> csr_m
     return matrix
 
 
-def rmse_on_dataframe(df: pd.DataFrame, user_factors: np.ndarray, item_factors: np.ndarray) -> float:
+def rmse_on_dataframe(df: pd.DataFrame, user_factors: np.ndarray, item_factors: np.ndarray, global_mean: float) -> float:
+    if len(df) == 0:
+        return 0.0
+
     user_ids = df['user_idx'].to_numpy(dtype=np.int64)
     movie_ids = df['movie_idx'].to_numpy(dtype=np.int64)
     targets = df['Rating'].to_numpy(dtype=np.float64)
 
-    preds = np.einsum("ij,ij->i", user_factors[user_ids], item_factors[movie_ids])
+    # Dự đoán bằng dot-product cộng lại giá trị trung bình (global mean)
+    preds = np.einsum("ij,ij->i", user_factors[user_ids], item_factors[movie_ids]) + global_mean
+    
     return float(np.sqrt(np.mean((targets - preds) ** 2)))
 
 
-def cross_validate_als(df: pd.DataFrame, num_users: int, num_movies: int, n_splits: int = 5) -> None:
+def cross_validate_als(df: pd.DataFrame, n_splits: int = 5) -> None:
     tss = TimeSeriesSplit(n_splits=n_splits)
     config = ALSConfig()
     fold_scores: list[float] = []
@@ -69,22 +101,25 @@ def cross_validate_als(df: pd.DataFrame, num_users: int, num_movies: int, n_spli
     print(f"Chạy {n_splits}-Fold Time Series Split với cấu hình mặc định: {config}")
 
     for fold_idx, (train_idx, val_idx) in enumerate(tss.split(df), start=1):
-        train_df = df.iloc[train_idx]
-        val_df = df.iloc[val_idx]
+        train_raw = df.iloc[train_idx]
+        val_raw = df.iloc[val_idx]
 
-        R_train = build_csr_matrix(train_df, num_users, num_movies)
+        train_mapped, val_mapped, num_users, num_movies, global_mean = prepare_fold(train_raw, val_raw)
+
+        R_train = build_csr_matrix(train_mapped, num_users, num_movies, rating_col='Rating_centered')
         model = ALSExplicitQR(config)
         user_factors, item_factors = model.fit(R_train)
 
-        train_rmse = model.rmse_observed(R_train)
-        val_rmse = rmse_on_dataframe(val_df, user_factors, item_factors)
+        train_rmse_centered = model.rmse_observed(R_train)
+        val_rmse = rmse_on_dataframe(val_mapped, user_factors, item_factors, global_mean)
         fold_scores.append(val_rmse)
 
         print(
             f"Fold {fold_idx:02d}: "
-            f"train_rmse={train_rmse:.6f} "
+            f"train_rmse_cen={train_rmse_centered:.6f} "
             f"val_rmse={val_rmse:.6f} "
-            f"train_nnz={R_train.nnz}"
+            f"train_nnz={R_train.nnz} "
+            f"val_nnz={len(val_mapped)}"
         )
 
     print(f"Validation RMSE mean: {np.mean(fold_scores):.6f}")
@@ -93,8 +128,6 @@ def cross_validate_als(df: pd.DataFrame, num_users: int, num_movies: int, n_spli
 
 def evaluate_config(
     df: pd.DataFrame,
-    num_users: int,
-    num_movies: int,
     config: ALSConfig,
     n_splits: int = 5,
 ) -> float:
@@ -102,29 +135,27 @@ def evaluate_config(
     fold_scores: list[float] = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(tss.split(df), start=1):
-        train_df = df.iloc[train_idx]
-        val_df = df.iloc[val_idx]
+        train_raw = df.iloc[train_idx]
+        val_raw = df.iloc[val_idx]
 
-        R_train = build_csr_matrix(train_df, num_users, num_movies)
+        train_mapped, val_mapped, num_users, num_movies, global_mean = prepare_fold(train_raw, val_raw)
+
+        if len(val_mapped) == 0:
+            continue
+            
+        R_train = build_csr_matrix(train_mapped, num_users, num_movies, rating_col='Rating_centered')
         model = ALSExplicitQR(config)
         user_factors, item_factors = model.fit(R_train)
 
-        train_rmse = model.rmse_observed(R_train)
-        val_rmse = rmse_on_dataframe(val_df, user_factors, item_factors)
+        train_rmse_centered = model.rmse_observed(R_train)
+        val_rmse = rmse_on_dataframe(val_mapped, user_factors, item_factors, global_mean)
         fold_scores.append(val_rmse)
-
-        print(
-            f"Fold {fold_idx:02d}: "
-            f"train_rmse={train_rmse:.6f} "
-            f"val_rmse={val_rmse:.6f} "
-            f"train_nnz={R_train.nnz}"
-        )
 
     mean_score = float(np.mean(fold_scores))
     return mean_score
 
 
-def optimize_hyperparameters(df: pd.DataFrame, num_users: int, num_movies: int, n_trials: int = 10, n_splits: int = 5) -> ALSConfig:
+def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 10, n_splits: int = 5) -> ALSConfig:
     def objective(trial: optuna.Trial) -> float:
         config = ALSConfig(
             factors=trial.suggest_int("factors", 8, 32, step=8),
@@ -134,12 +165,8 @@ def optimize_hyperparameters(df: pd.DataFrame, num_users: int, num_movies: int, 
             seed=7,
             verbose=False,
         )
-        score = evaluate_config(df, num_users, num_movies, config, n_splits=n_splits)
-        print(
-            f"Trial {trial.number:02d}: "
-            f"score={score:.6f} "
-            f"params={config}"
-        )
+        score = evaluate_config(df, config, n_splits=n_splits)
+        print(f"Trial {trial.number:02d}: score={score:.6f} params={config}")
         return score
 
     study = optuna.create_study(direction="minimize")
@@ -162,21 +189,28 @@ def optimize_hyperparameters(df: pd.DataFrame, num_users: int, num_movies: int, 
 
 
 def main() -> None:
-    df, num_users, num_movies = preprocess('./ml-1m/ratings.dat')
+    # Changed standard file load to point to our newly generated 32M filtered DB!
+    df = preprocess('./ratings_filtered.csv')
+    
     train_df, test_df = split_train_test_by_time(df, test_size=0.2)
 
-    print(f"Train rows: {len(train_df)} | Test rows: {len(test_df)}")
+    print(f"Train rows (Raw): {len(train_df)} | Test rows (Raw): {len(test_df)}")
 
-    best_config = optimize_hyperparameters(train_df, num_users, num_movies, n_trials=50, n_splits=5)
+    best_config = optimize_hyperparameters(train_df, n_trials=50, n_splits=5)
 
-    print(f"Chạy lại ALS với best config: {best_config}")
-    R_train_full = build_csr_matrix(train_df, num_users, num_movies)
+    print(f"Chạy lại ALS với best config trên bộ Train gốc: {best_config}")
+    
+    train_mapped, test_mapped, num_users, num_movies, global_mean = prepare_fold(train_df, test_df)
+    print(f"Warm-Start Test rows thực tế để đánh giá: {len(test_mapped)} / {len(test_df)}")
+
+    R_train_full = build_csr_matrix(train_mapped, num_users, num_movies, rating_col='Rating_centered')
     final_model = ALSExplicitQR(best_config)
     user_factors, item_factors = final_model.fit(R_train_full)
 
-    final_train_rmse = final_model.rmse_observed(R_train_full)
-    test_rmse = rmse_on_dataframe(test_df, user_factors, item_factors)
-    print(f"Final train RMSE: {final_train_rmse:.6f}")
+    final_train_rmse_centered = final_model.rmse_observed(R_train_full)
+    test_rmse = rmse_on_dataframe(test_mapped, user_factors, item_factors, global_mean)
+    
+    print(f"Final train RMSE (centered): {final_train_rmse_centered:.6f}")
     print(f"Test RMSE: {test_rmse:.6f}")
     print(f"User factors shape: {user_factors.shape}")
     print(f"Item factors shape: {item_factors.shape}")
