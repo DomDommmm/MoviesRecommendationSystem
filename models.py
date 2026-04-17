@@ -140,7 +140,7 @@ def evaluate_config(
     for fold_idx, (train_idx, val_idx) in enumerate(tss.split(df), start=1):
         fold_start = time.time()
         current_time = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"[{current_time}]  --> Training Fold {fold_idx}/{n_splits} on GPU...")
+        print(f"[{current_time}]  --> Training Fold {fold_idx}/{n_splits} on CPU...")
         
         train_raw = df.iloc[train_idx]
         val_raw = df.iloc[val_idx]
@@ -165,7 +165,7 @@ def evaluate_config(
     return mean_score
 
 
-def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 10, n_splits: int = 4) -> ALSConfig:
+def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 30, n_splits: int = 4) -> ALSConfig:
     def objective(trial: optuna.Trial) -> float:
         config = ALSConfig(
             factors=trial.suggest_categorical("factors", [16, 32, 64, 128]),
@@ -209,7 +209,7 @@ def main() -> None:
 
     print(f"Train rows (Raw): {len(train_df)} | Test rows (Raw): {len(test_df)}")
 
-    best_config = optimize_hyperparameters(train_df, n_trials=30)
+    best_config = optimize_hyperparameters(train_df)
 
     print(f"Chạy lại ALS với best config trên bộ Train gốc: {best_config}")
     

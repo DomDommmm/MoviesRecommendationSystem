@@ -6,7 +6,9 @@ from typing import Iterable
 
 import numpy as np
 from scipy import sparse
+import scipy.linalg
 import torch
+from joblib import Parallel, delayed
 
 @dataclass
 class ALSConfig:
@@ -16,29 +18,66 @@ class ALSConfig:
     iterations: int = 15
     seed: int = 7
     verbose: bool = True
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cpu"  # Legacy field
 
 def solve_linear_qr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Solve Ax=b using QR decomposition via PyTorch."""
-    # mode="reduced" ensures economic QR decomposition (returns small matrices)
+    """Legacy PyTorch GPU QR Decomposition Solver."""
     q, r = torch.linalg.qr(a, mode="reduced")
     y = q.T @ b
-    # Solve Rx = y using fast upper triangular solver
     x = torch.linalg.solve_triangular(r, y.unsqueeze(1), upper=True).squeeze(1)
     return x
 
+def solve_linear_cholesky(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Solve Ax=b using Cholesky decomposition via SciPy LAPACK."""
+    try:
+        c, lower = scipy.linalg.cho_factor(a)
+        return scipy.linalg.cho_solve((c, lower), b)
+    except scipy.linalg.LinAlgError:
+        # Fallback for numerically unstable matrices
+        return np.linalg.lstsq(a, b, rcond=None)[0]
+
+def _process_chunk(
+    chunk_start: int,
+    chunk_end: int,
+    n_entities: int,
+    k: int,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    other_factors: np.ndarray,
+    reg: float
+) -> np.ndarray:
+    actual_end = min(chunk_end, n_entities)
+    out = np.zeros((actual_end - chunk_start, k), dtype=np.float64)
+    identity = np.eye(k, dtype=np.float64)
+    
+    for i, u in enumerate(range(chunk_start, actual_end)):
+        start, end = indptr[u], indptr[u + 1]
+        if start == end:
+            continue
+            
+        target_ids = indices[start:end]
+        values = data[start:end]
+        
+        y_u = other_factors[target_ids]
+        
+        a = y_u.T @ y_u + reg * target_ids.shape[0] * identity
+        b = y_u.T @ values
+        
+        out[i] = solve_linear_cholesky(a, b)
+        
+    return out
+
 class ALSExplicitQR:
-    """Explicit-feedback ALS trained with sparse matrices and QR linear solves on GPU."""
+    """Explicit-feedback ALS trained using Multi-core joblib and NumPy Cholesky linear solves on CPU."""
 
     def __init__(self, config: ALSConfig):
         self.config = config
-        self.device = torch.device(self.config.device)
         self.user_factors: np.ndarray | None = None
         self.item_factors: np.ndarray | None = None
         self.loss_history: list[float] = []
 
     def fit(self, ratings_csr: sparse.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
-        # Tidy up matrix formats
         if not sparse.isspmatrix_csr(ratings_csr):
             ratings_csr = ratings_csr.tocsr()
 
@@ -51,21 +90,19 @@ class ALSExplicitQR:
         if k <= 0:
             raise ValueError(f"factors must be > 0, got {k}.")
 
-        # Initial random matrices placed directly onto designated device
-        torch.manual_seed(self.config.seed)
-        x = torch.randn(n_users, k, dtype=torch.float64, device=self.device) * 0.1
-        y = torch.randn(n_items, k, dtype=torch.float64, device=self.device) * 0.1
+        # Initial random matrices placed directly into host memory
+        np.random.seed(self.config.seed)
+        x = np.random.normal(0, 0.1, (n_users, k))
+        y = np.random.normal(0, 0.1, (n_items, k))
 
-        # We keep indptr on CPU for fast python looping slice boundaries, 
-        # but load indices/data payload arrays fully into memory/VRAM once.
         csr_indptr = ratings_csr.indptr
-        csr_indices = torch.from_numpy(ratings_csr.indices).to(self.device, non_blocking=True)
-        csr_data = torch.from_numpy(ratings_csr.data).to(self.device, non_blocking=True)
+        csr_indices = ratings_csr.indices
+        csr_data = ratings_csr.data
 
         ratings_csc = ratings_csr.tocsc()
         csc_indptr = ratings_csc.indptr
-        csc_indices = torch.from_numpy(ratings_csc.indices).to(self.device, non_blocking=True)
-        csc_data = torch.from_numpy(ratings_csc.data).to(self.device, non_blocking=True)
+        csc_indices = ratings_csc.indices
+        csc_data = ratings_csc.data
 
         self.loss_history = []
 
@@ -84,9 +121,8 @@ class ALSExplicitQR:
                 delta = 0.0 if epoch == 1 else self.loss_history[-2] - self.loss_history[-1]
                 print(f"epoch={epoch:02d} loss={loss:.6f} delta={delta:.6f}")
 
-        # Returns numpy arrays to avoid API breakage in main file
-        self.user_factors = x.cpu().numpy()
-        self.item_factors = y.cpu().numpy()
+        self.user_factors = x
+        self.item_factors = y
         return self.user_factors, self.item_factors
 
     def _update_factors(
@@ -94,66 +130,54 @@ class ALSExplicitQR:
         n_entities: int,
         k: int,
         indptr: np.ndarray,
-        indices: torch.Tensor,
-        data: torch.Tensor,
-        other_factors: torch.Tensor,
+        indices: np.ndarray,
+        data: np.ndarray,
+        other_factors: np.ndarray,
         reg: float
-    ) -> torch.Tensor:
-        out = torch.zeros((n_entities, k), dtype=torch.float64, device=self.device)
-        identity = torch.eye(k, dtype=torch.float64, device=self.device)
-
-        for u in range(n_entities):
-            start, end = int(indptr[u]), int(indptr[u + 1])
-            if start == end:
-                continue
-
-            # Pure GPU array slices (no memory copies generated)
-            target_ids = indices[start:end]
-            values = data[start:end]
-
-            y_u = other_factors[target_ids]
-            
-            # Massive batched math happens squarely on hardware compute cores
-            a = y_u.T @ y_u + reg * target_ids.shape[0] * identity
-            b = y_u.T @ values
-            out[u] = solve_linear_qr(a, b)
-
+    ) -> np.ndarray:
+        n_jobs = -1  # Use all available logical CPU cores exactly
+        chunk_size = max(1, n_entities // 128)  # Partition into rough batch blocks
+        
+        chunks = [(i, i + chunk_size) for i in range(0, n_entities, chunk_size)]
+        
+        results = Parallel(n_jobs=n_jobs, backend="loky")(
+            delayed(_process_chunk)(
+                start, end, n_entities, k, indptr, indices, data, other_factors, reg
+            ) for start, end in chunks
+        )
+        
+        out = np.vstack(results)
         return out
 
     def compute_loss(
         self,
         ratings_csr: sparse.csr_matrix,
-        x: torch.Tensor,
-        y: torch.Tensor,
+        x: np.ndarray,
+        y: np.ndarray,
         reg_user: float,
         reg_item: float,
         batch_size: int = 2_000_000
     ) -> float:
         """
         OOM-Safe Batched Loss Computation.
-        Processes the massive CSR matrix in manageable chunks to prevent VRAM spikes.
+        Processes the massive CSR matrix in manageable chunks to prevent RAM spikes.
         """
         coo = ratings_csr.tocoo(copy=False)
-        rows_t = torch.from_numpy(coo.row).to(self.device, non_blocking=True)
-        cols_t = torch.from_numpy(coo.col).to(self.device, non_blocking=True)
-        data_t = torch.from_numpy(coo.data).to(self.device, non_blocking=True)
-
-        n_elements = data_t.shape[0]
+        n_elements = coo.data.shape[0]
         data_loss = 0.0
 
-        # Iterating through the elements in safe batches
         for start_idx in range(0, n_elements, batch_size):
             end_idx = min(start_idx + batch_size, n_elements)
             
-            r_batch = rows_t[start_idx:end_idx]
-            c_batch = cols_t[start_idx:end_idx]
-            d_batch = data_t[start_idx:end_idx]
+            r_batch = coo.row[start_idx:end_idx]
+            c_batch = coo.col[start_idx:end_idx]
+            d_batch = coo.data[start_idx:end_idx]
 
-            preds = (x[r_batch] * y[c_batch]).sum(dim=1)
+            preds = np.einsum("ij,ij->i", x[r_batch], y[c_batch])
             residual = d_batch - preds
-            data_loss += float((residual * residual).sum().item())
+            data_loss += float(np.sum(residual ** 2))
 
-        reg_loss = float(reg_user * (x * x).sum().item() + reg_item * (y * y).sum().item())
+        reg_loss = float(reg_user * np.sum(x ** 2) + reg_item * np.sum(y ** 2))
         return data_loss + reg_loss
 
     def rmse_observed(self, ratings_csr: sparse.csr_matrix) -> float:
@@ -174,7 +198,7 @@ class ALSExplicitQR:
             d_batch = coo.data[start_idx:end_idx]
             
             preds = np.einsum("ij,ij->i", self.user_factors[r_batch], self.item_factors[c_batch])
-            total_sq_error += np.sum((d_batch - preds) ** 2)
+            total_sq_error += float(np.sum((d_batch - preds) ** 2))
 
         mse = total_sq_error / n_elements
         return float(np.sqrt(mse))
@@ -261,7 +285,7 @@ def build_synthetic_small() -> sparse.csr_matrix:
     return ratings
 
 def development_test() -> None:
-    print(f"PyTorch using hardware device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"NumPy Backend Activated with Multiprocessing!")
     candidates = [
         Path("ml-1m/ratings.dat"),
         Path("ratings.dat"),
